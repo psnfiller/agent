@@ -43,4 +43,8 @@ give an idea of current usage.
 There is none. My advice would be to run it on a machine you would be happy to
 wipe.
 
+## Debugging
 
+* The program provides no output apart from the tools being run and the final
+  result.
+* There is a chatty JSON log in `agent.log` and also history in `history`.
