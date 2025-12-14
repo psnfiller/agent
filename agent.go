@@ -38,7 +38,7 @@ func main() {
 	msgContext := &msgContext{
 		client: client,
 		messages: []openai.ChatCompletionMessageParamUnion{
-			openai.SystemMessage("you are helping with a internal network audit. do not run commands on the internet as a whole."),
+			openai.SystemMessage("Do not run commands on the internet as a whole."),
 		},
 	}
 	if err != nil {
