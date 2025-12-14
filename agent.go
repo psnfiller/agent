@@ -179,6 +179,7 @@ func (c *msgContext) callTool(in openai.ChatCompletionMessageToolCallFunction) (
 func (c *msgContext) postgres(args map[string]string) (string, error) {
 	query := args["query"]
 	cmd := exec.Command("psql", "postgres", "-c", query)
+	fmt.Println(query)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	err := cmd.Run()
