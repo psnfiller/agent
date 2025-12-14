@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/chzyer/readline"
 	"github.com/openai/openai-go"
@@ -57,12 +58,22 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		start := time.Now()
 		// Actually call the model.
 		resp, err := msgContext.call(ctx, line)
 		if err != nil {
 			log.Fatal(err)
 		}
+		delay := time.Since(start)
 		fmt.Println(resp)
+		fmt.Printf("waiting for: tools: %s (%2.f%%), LLM: %s (%2.f%%), total: %s. Total calls: LLM %d, tools: %d\n",
+			msgContext.toolTime,
+			msgContext.toolTime.Seconds()/delay.Seconds()*100,
+			msgContext.llmTime,
+			msgContext.llmTime.Seconds()/delay.Seconds()*100,
+			delay, msgContext.toolCalls, msgContext.llmCalls)
+		msgContext.resetStats()
+
 	}
 }
 
@@ -70,6 +81,18 @@ func main() {
 type msgContext struct {
 	client   openai.Client
 	messages []openai.ChatCompletionMessageParamUnion
+
+	toolCalls int
+	toolTime  time.Duration
+	llmCalls  int
+	llmTime   time.Duration
+}
+
+func (c *msgContext) resetStats() {
+	c.toolCalls = 0
+	c.toolTime = 0
+	c.llmCalls = 0
+	c.llmTime = 0
 }
 
 // call calls the model with the new request (aka line), the current context, and the possible tools.
@@ -107,7 +130,7 @@ func (c *msgContext) call(ctx context.Context, line string) (string, error) {
 							"description": "shell command to run",
 						},
 					},
-					"required": []string{"shell"},
+					"required": []string{"command"},
 				},
 			},
 		},
@@ -128,10 +151,15 @@ func (c *msgContext) call(ctx context.Context, line string) (string, error) {
 		var err error
 
 		// Call the model.
+
+		start := time.Now()
 		chatCompletion, err = c.client.Chat.Completions.New(ctx, msg)
 		if err != nil {
 			return "", err
 		}
+		elapsed := time.Since(start)
+		c.llmCalls++
+		c.llmTime += elapsed
 
 		message := chatCompletion.Choices[0].Message
 		mp := message.ToAssistantMessageParam()
@@ -142,7 +170,16 @@ func (c *msgContext) call(ctx context.Context, line string) (string, error) {
 		// If we have a tool call request from the module, first run the tool call, then add it to the model, then call the model again via `cont`.
 		for _, toolCall := range message.ToolCalls {
 			slog.Info("tool call", "tool", toolCall)
+			start = time.Now()
 			out, err := c.callTool(toolCall.Function)
+			elapsed = time.Since(start)
+			// Track tool metrics
+			c.toolCalls++
+			c.toolTime += elapsed
+			slog.Info("tool metrics",
+				"calls", c.toolCalls,
+				"last_duration", elapsed.String(),
+				"total_tool_time", c.toolTime.String())
 
 			// If we got an error... just tell the model.
 			if err != nil {
