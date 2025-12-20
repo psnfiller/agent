@@ -66,12 +66,12 @@ func main() {
 		}
 		delay := time.Since(start)
 		fmt.Println(resp)
-		fmt.Printf("waiting for: tools: %s (%2.f%%), LLM: %s (%2.f%%), total: %s. Total calls: LLM %d, tools: %d\n",
+		fmt.Printf("waiting for: tools: %s (%2.f%%), LLM: %s (%2.f%%), total: %s. Total calls: LLM %d, tools: %d tokens: %d\n",
 			msgContext.toolTime,
 			msgContext.toolTime.Seconds()/delay.Seconds()*100,
 			msgContext.llmTime,
 			msgContext.llmTime.Seconds()/delay.Seconds()*100,
-			delay, msgContext.toolCalls, msgContext.llmCalls)
+			delay, msgContext.toolCalls, msgContext.llmCalls, msgContext.tokens)
 		msgContext.resetStats()
 
 	}
@@ -86,6 +86,7 @@ type msgContext struct {
 	toolTime  time.Duration
 	llmCalls  int
 	llmTime   time.Duration
+	tokens    int64
 }
 
 func (c *msgContext) resetStats() {
@@ -93,6 +94,7 @@ func (c *msgContext) resetStats() {
 	c.toolTime = 0
 	c.llmCalls = 0
 	c.llmTime = 0
+	c.tokens = 0
 }
 
 // call calls the model with the new request (aka line), the current context, and the possible tools.
@@ -161,6 +163,18 @@ func (c *msgContext) call(ctx context.Context, line string) (string, error) {
 		c.llmCalls++
 		c.llmTime += elapsed
 
+		// Log token usage and accumulate totals if available
+		u := chatCompletion.Usage
+		c.tokens += u.TotalTokens
+		slog.Info("llm usage",
+			"id", chatCompletion.ID,
+			"model", chatCompletion.Model,
+			"prompt_tokens", u.PromptTokens,
+			"completion_tokens", u.CompletionTokens,
+			"total_tokens", u.TotalTokens,
+			"elapsed", elapsed.String(),
+		)
+
 		message := chatCompletion.Choices[0].Message
 		mp := message.ToAssistantMessageParam()
 
@@ -169,7 +183,11 @@ func (c *msgContext) call(ctx context.Context, line string) (string, error) {
 
 		// If we have a tool call request from the module, first run the tool call, then add it to the model, then call the model again via `cont`.
 		for _, toolCall := range message.ToolCalls {
-			slog.Info("tool call", "tool", toolCall)
+			argsPreview := toolCall.Function.Arguments
+			if len(argsPreview) > 300 {
+				argsPreview = argsPreview[:300] + "… (truncated)"
+			}
+			slog.Info("tool call", "id", toolCall.ID, "name", toolCall.Function.Name, "args", argsPreview)
 			start = time.Now()
 			out, err := c.callTool(toolCall.Function)
 			elapsed = time.Since(start)
@@ -197,7 +215,7 @@ func (c *msgContext) call(ctx context.Context, line string) (string, error) {
 
 // callTool dispatches the request to one of the tools provided.
 func (c *msgContext) callTool(in openai.ChatCompletionMessageToolCallFunction) (string, error) {
-	slog.Info("calltool", "in", in)
+	slog.Info("calltool.start", "name", in.Name, "args", in.Arguments)
 	args := map[string]string{}
 	if err := json.Unmarshal([]byte(in.Arguments), &args); err != nil {
 		slog.Error("failed to unmarsh", "err", err)
@@ -220,7 +238,9 @@ func (c *msgContext) postgres(args map[string]string) (string, error) {
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	err := cmd.Run()
-	return stdout.String(), err
+	out := stdout.String()
+	slog.Info("command finished", "exit_err", err, "bytes", len(out))
+	return out, err
 }
 
 func (c *msgContext) shell(args map[string]string) (string, error) {
@@ -232,5 +252,7 @@ func (c *msgContext) shell(args map[string]string) (string, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stdout
 	err := cmd.Run()
-	return stdout.String(), err
+	out := stdout.String()
+	slog.Info("command finished", "exit_err", err, "bytes", len(out))
+	return out, err
 }
