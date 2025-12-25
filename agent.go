@@ -9,10 +9,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
+	"io"
 	"log"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
 	"time"
 
 	"github.com/chzyer/readline"
@@ -104,7 +109,7 @@ func (c *msgContext) call(ctx context.Context, line string) (string, error) {
 
 	// The set of tools the model can call.
 	tools := []openai.ChatCompletionToolParam{
-		openai.ChatCompletionToolParam{
+		{
 			Function: openai.FunctionDefinitionParam{
 				Name:        "postgres",
 				Description: param.NewOpt("query the postgres db"),
@@ -120,7 +125,7 @@ func (c *msgContext) call(ctx context.Context, line string) (string, error) {
 				},
 			},
 		},
-		openai.ChatCompletionToolParam{
+		{
 			Function: openai.FunctionDefinitionParam{
 				Name:        "shell",
 				Description: param.NewOpt("run a shell command"),
@@ -133,6 +138,26 @@ func (c *msgContext) call(ctx context.Context, line string) (string, error) {
 						},
 					},
 					"required": []string{"command"},
+				},
+			},
+		},
+		{
+			Function: openai.FunctionDefinitionParam{
+				Name:        "web_search",
+				Description: param.NewOpt("perform a web search and return top result titles and URLs"),
+				Parameters: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"query": map[string]interface{}{
+							"type":        "string",
+							"description": "search query",
+						},
+						"max_results": map[string]interface{}{
+							"type":        "integer",
+							"description": "maximum number of results to return (default 5, max 10)",
+						},
+					},
+					"required": []string{"query"},
 				},
 			},
 		},
@@ -226,6 +251,8 @@ func (c *msgContext) callTool(in openai.ChatCompletionMessageToolCallFunction) (
 		return c.postgres(args)
 	case "shell":
 		return c.shell(args)
+	case "web_search":
+		return c.webSearch(args)
 	default:
 		return "", errors.New("no tool")
 	}
@@ -255,4 +282,76 @@ func (c *msgContext) shell(args map[string]string) (string, error) {
 	out := stdout.String()
 	slog.Info("command finished", "exit_err", err, "bytes", len(out))
 	return out, err
+}
+
+// webSearch performs a simple web search using DuckDuckGo's HTML endpoint and returns
+// up to maxResults lines in the format: "N. Title\nURL" per result.
+// This keeps output compact and avoids fetching large pages.
+func (c *msgContext) webSearch(args map[string]string) (string, error) {
+	q := args["query"]
+	if q == "" {
+		return "", errors.New("missing query")
+	}
+	maxResults := 5
+	if v, ok := args["max_results"]; ok && v != "" {
+		var n int
+		fmt.Sscanf(v, "%d", &n)
+		if n > 0 {
+			if n > 10 {
+				n = 10
+			}
+			maxResults = n
+		}
+	}
+
+	// Build request to DuckDuckGo's lightweight HTML interface.
+	u := &url.URL{Scheme: "https", Host: "html.duckduckgo.com", Path: "/html/"}
+	qv := url.Values{}
+	qv.Set("q", q)
+	qv.Set("kl", "us-en")
+	u.RawQuery = qv.Encode()
+
+	req, err := http.NewRequest("GET", u.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "agent/1.0 (+local)")
+
+	client := &http.Client{Timeout: 12 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("search http status %d", resp.StatusCode)
+	}
+
+	// Limit read to avoid huge responses.
+	var lr io.Reader = io.LimitReader(resp.Body, 1<<20) // 1 MiB
+	body, err := io.ReadAll(lr)
+	if err != nil {
+		return "", err
+	}
+
+	// Extract result titles and links from HTML.
+	// Matches anchors with class containing result__a, capturing href and inner text.
+	re := regexp.MustCompile(`<a[^>]*class=\"[^\"]*result__a[^\"]*\"[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>`)
+	matches := re.FindAllStringSubmatch(string(body), maxResults)
+	if len(matches) == 0 {
+		return "no results", nil
+	}
+
+	// Clean HTML tags from title (in case of nested tags) and unescape entities.
+	stripTags := regexp.MustCompile(`<[^>]+>`)
+	var out bytes.Buffer
+	for i, m := range matches {
+		if i >= maxResults {
+			break
+		}
+		href := html.UnescapeString(m[1])
+		title := html.UnescapeString(stripTags.ReplaceAllString(m[2], ""))
+		fmt.Fprintf(&out, "%d. %s\n%s\n", i+1, title, href)
+	}
+	return out.String(), nil
 }
