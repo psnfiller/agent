@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/chzyer/readline"
@@ -161,6 +162,21 @@ func (c *msgContext) call(ctx context.Context, line string) (string, error) {
 				},
 			},
 		},
+		{
+			Function: openai.FunctionDefinitionParam{
+				Name:        "patch_file",
+				Description: param.NewOpt("apply a unified diff patch to files on disk"),
+				Parameters: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"patch": map[string]interface{}{"type": "string", "description": "unified diff patch content"},
+						"dir":   map[string]interface{}{"type": "string", "description": "directory to run patch from (optional)"},
+						"strip": map[string]interface{}{"type": "integer", "description": "override -p strip level (optional)"},
+					},
+					"required": []string{"patch"},
+				},
+			},
+		},
 	}
 
 	// Add the new message from the user to the context.
@@ -239,24 +255,6 @@ func (c *msgContext) call(ctx context.Context, line string) (string, error) {
 }
 
 // callTool dispatches the request to one of the tools provided.
-func (c *msgContext) callTool(in openai.ChatCompletionMessageToolCallFunction) (string, error) {
-	slog.Info("calltool.start", "name", in.Name, "args", in.Arguments)
-	args := map[string]string{}
-	if err := json.Unmarshal([]byte(in.Arguments), &args); err != nil {
-		slog.Error("failed to unmarsh", "err", err)
-		return "", err
-	}
-	switch in.Name {
-	case "postgres":
-		return c.postgres(args)
-	case "shell":
-		return c.shell(args)
-	case "web_search":
-		return c.webSearch(args)
-	default:
-		return "", errors.New("no tool")
-	}
-}
 
 func (c *msgContext) postgres(args map[string]string) (string, error) {
 	query := args["query"]
@@ -287,6 +285,10 @@ func (c *msgContext) shell(args map[string]string) (string, error) {
 // webSearch performs a simple web search using DuckDuckGo's HTML endpoint and returns
 // up to maxResults lines in the format: "N. Title\nURL" per result.
 // This keeps output compact and avoids fetching large pages.
+// patchFile applies a unified diff patch string to the filesystem using the system "patch" command.
+
+// patchFile applies a unified diff patch string to the filesystem using the system "patch" command.
+
 func (c *msgContext) webSearch(args map[string]string) (string, error) {
 	q := args["query"]
 	if q == "" {
@@ -354,4 +356,70 @@ func (c *msgContext) webSearch(args map[string]string) (string, error) {
 		fmt.Fprintf(&out, "%d. %s\n%s\n", i+1, title, href)
 	}
 	return out.String(), nil
+}
+
+// callTool dispatches the request to one of the tools provided.
+func (c *msgContext) callTool(in openai.ChatCompletionMessageToolCallFunction) (string, error) {
+	slog.Info("calltool.start", "name", in.Name, "args", in.Arguments)
+	args := map[string]string{}
+	if err := json.Unmarshal([]byte(in.Arguments), &args); err != nil {
+		slog.Error("failed to unmarsh", "err", err)
+		return "", err
+	}
+	switch in.Name {
+	case "postgres":
+		return c.postgres(args)
+	case "shell":
+		return c.shell(args)
+	case "web_search":
+		return c.webSearch(args)
+	case "patch_file":
+		return c.patchFile(args)
+	default:
+		return "", errors.New("no tool")
+	}
+}
+
+// patchFile applies a unified diff patch string to the filesystem using the system "patch" command.
+func (c *msgContext) patchFile(args map[string]string) (string, error) {
+	content := args["patch"]
+	if content == "" {
+		return "", errors.New("missing patch")
+	}
+	dir := args["dir"]
+	strip := -1
+	if s, ok := args["strip"]; ok && s != "" {
+		fmt.Sscanf(s, "%d", &strip)
+	}
+	if strip < 0 {
+		// Heuristic: git-style patches use a/ and b/ paths -> -p1
+		if strings.Contains(content, "\n--- a/") || strings.Contains(content, "\n+++ b/") {
+			strip = 1
+		} else {
+			strip = 0
+		}
+	}
+	tmp, err := os.CreateTemp("", "agent-patch-*.diff")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	cmd := exec.Command("patch", fmt.Sprintf("-p%d", strip), "-N", "-i", tmp.Name())
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stdout
+	err = cmd.Run()
+	out := stdout.String()
+	slog.Info("patch finished", "exit_err", err, "bytes", len(out))
+	return out, err
 }
