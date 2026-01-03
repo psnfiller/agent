@@ -13,6 +13,10 @@ You need a OpenAI API Key.  You then run with
 % go run agent
 ```
 
+```sh
+OPENAI_API_KEY=$(op item get openai-key --reveal) go run .
+```
+
 It prints out each tool as it runs it.
 
 It can answer many questions, for example:
