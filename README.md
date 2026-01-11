@@ -14,7 +14,7 @@ You need a OpenAI API Key.  You then run with
 ```
 
 ```sh
-OPENAI_API_KEY=$(op item get openai-key --reveal) go run .
+OPENAI_API_KEY=$(op item get openai-key --reveal  --fields credential) go run .
 ```
 
 It prints out each tool as it runs it.

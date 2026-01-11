@@ -37,6 +37,11 @@ func main() {
 	logger := slog.New(handler)
 	slog.SetDefault(logger)
 
+	if k := os.Getenv("OPENAI_API_KEY"); k == "" {
+		log.Fatal("no OPENAI_API_KEY, nothing is going to work")
+	}
+	slog.Info("connecting to openai")
+
 	ctx := context.Background()
 	client := openai.NewClient()
 
@@ -129,7 +134,7 @@ func (c *msgContext) call(ctx context.Context, line string) (string, error) {
 		{
 			Function: openai.FunctionDefinitionParam{
 				Name:        "shell",
-				Description: param.NewOpt("run a shell command"),
+				Description: param.NewOpt("run a shell command. There is a 10s timeout."),
 				Parameters: map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
@@ -230,7 +235,7 @@ func (c *msgContext) call(ctx context.Context, line string) (string, error) {
 			}
 			slog.Info("tool call", "id", toolCall.ID, "name", toolCall.Function.Name, "args", argsPreview)
 			start = time.Now()
-			out, err := c.callTool(toolCall.Function)
+			out, err := c.callTool(ctx, toolCall.Function)
 			elapsed = time.Since(start)
 			// Track tool metrics
 			c.toolCalls++
@@ -268,10 +273,12 @@ func (c *msgContext) postgres(args map[string]string) (string, error) {
 	return out, err
 }
 
-func (c *msgContext) shell(args map[string]string) (string, error) {
+func (c *msgContext) shell(ctx context.Context, args map[string]string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	slog.Info("running command", "args", args)
 	query := args["command"]
-	cmd := exec.Command("/bin/bash", "-c", query)
+	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", query)
 	fmt.Println(query)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
@@ -359,7 +366,7 @@ func (c *msgContext) webSearch(args map[string]string) (string, error) {
 }
 
 // callTool dispatches the request to one of the tools provided.
-func (c *msgContext) callTool(in openai.ChatCompletionMessageToolCallFunction) (string, error) {
+func (c *msgContext) callTool(ctx context.Context, in openai.ChatCompletionMessageToolCallFunction) (string, error) {
 	slog.Info("calltool.start", "name", in.Name, "args", in.Arguments)
 	args := map[string]string{}
 	if err := json.Unmarshal([]byte(in.Arguments), &args); err != nil {
@@ -370,7 +377,7 @@ func (c *msgContext) callTool(in openai.ChatCompletionMessageToolCallFunction) (
 	case "postgres":
 		return c.postgres(args)
 	case "shell":
-		return c.shell(args)
+		return c.shell(ctx, args)
 	case "web_search":
 		return c.webSearch(args)
 	case "patch_file":
