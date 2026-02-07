@@ -26,6 +26,10 @@ import (
 	"github.com/openai/openai-go/packages/param"
 )
 
+var (
+	delayRE = regexp.MustCompile(`Please try again in ([0-9\.s]+)\. `)
+)
+
 func main() {
 	// Set up logging.
 	f, err := os.OpenFile("agent.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -98,6 +102,7 @@ type msgContext struct {
 	llmCalls  int
 	llmTime   time.Duration
 	tokens    int64
+	retries   int64
 }
 
 func (c *msgContext) resetStats() {
@@ -106,6 +111,7 @@ func (c *msgContext) resetStats() {
 	c.llmCalls = 0
 	c.llmTime = 0
 	c.tokens = 0
+	c.retries = 0
 }
 
 // call calls the model with the new request (aka line), the current context, and the possible tools.
@@ -201,13 +207,32 @@ func (c *msgContext) call(ctx context.Context, line string) (string, error) {
 		// Call the model.
 
 		start := time.Now()
-		chatCompletion, err = c.client.Chat.Completions.New(ctx, msg)
-		if err != nil {
-			return "", err
+
+		var elapsed time.Duration
+		for i := 0; true; i++ {
+			chatCompletion, err = c.client.Chat.Completions.New(ctx, msg)
+			elapsed = time.Since(start)
+			c.llmCalls++
+			c.llmTime += elapsed
+			if i > 0 {
+				c.retries++
+			}
+
+			if err == nil {
+				break
+			}
+			f := delayRE.FindString(err.Error())
+			if f == "" {
+				return "", err
+			}
+			sleep, pderr := time.ParseDuration(f)
+			if pderr != nil {
+				slog.Error("failed to parse", "duration", f, "err", pderr)
+				return "", err
+			}
+			slog.Info("sleeping for", "duration", sleep)
+			time.Sleep(sleep)
 		}
-		elapsed := time.Since(start)
-		c.llmCalls++
-		c.llmTime += elapsed
 
 		// Log token usage and accumulate totals if available
 		u := chatCompletion.Usage
