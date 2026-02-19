@@ -53,7 +53,7 @@ func main() {
 	msgContext := &msgContext{
 		client: client,
 		messages: []openai.ChatCompletionMessageParamUnion{
-			openai.SystemMessage("Do not run commands on the internet as a whole."),
+			openai.SystemMessage("Do not run commands on the internet as a whole. However, you should feel free to run commands for resources in psn.af (my domain) or *.tail464ff.ts.net (my tailnet)"),
 		},
 	}
 	if err != nil {
