@@ -24,6 +24,8 @@ import (
 	"github.com/chzyer/readline"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/packages/param"
+	"github.com/openai/openai-go/responses"
+	"github.com/openai/openai-go/shared"
 )
 
 var (
@@ -51,10 +53,8 @@ func main() {
 
 	// Set up the context. We will add to this each time we go around the main loop.
 	msgContext := &msgContext{
-		client: client,
-		messages: []openai.ChatCompletionMessageParamUnion{
-			openai.SystemMessage("Do not run commands on the internet as a whole. However, you should feel free to run commands for resources in psn.af (my domain) or *.tail464ff.ts.net (my tailnet)"),
-		},
+		client:       client,
+		instructions: "Do not run commands on the internet as a whole. However, you should feel free to run commands for resources in psn.af (my domain) or *.tail464ff.ts.net (my tailnet). You can run web search if needed, and use curl to fetch pages if needed. ",
 	}
 	if err != nil {
 		log.Fatal(err)
@@ -94,8 +94,9 @@ func main() {
 
 // msgContext is the current context sent to the model on each request.
 type msgContext struct {
-	client   openai.Client
-	messages []openai.ChatCompletionMessageParamUnion
+	client       openai.Client
+	instructions string
+	prevRespID   string // ID of the last response, for stateful multi-turn via previous_response_id
 
 	toolCalls int
 	toolTime  time.Duration
@@ -120,97 +121,72 @@ func (c *msgContext) resetStats() {
 func (c *msgContext) call(ctx context.Context, line string) (string, error) {
 
 	// The set of tools the model can call.
-	tools := []openai.ChatCompletionToolParam{
-		{
-			Function: openai.FunctionDefinitionParam{
-				Name:        "postgres",
-				Description: param.NewOpt("query the postgres db"),
-				Parameters: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"query": map[string]interface{}{
-							"type":        "string",
-							"description": "postgres query to run ",
-						},
-					},
-					"required": []string{"query"},
-				},
+	tools := []responses.ToolUnionParam{
+		responses.ToolParamOfFunction("postgres", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query": map[string]any{"type": "string", "description": "postgres query to run"},
 			},
-		},
-		{
-			Function: openai.FunctionDefinitionParam{
-				Name:        "shell",
-				Description: param.NewOpt("run a shell command. There is a 10s timeout."),
-				Parameters: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"command": map[string]interface{}{
-							"type":        "string",
-							"description": "shell command to run",
-						},
-					},
-					"required": []string{"command"},
-				},
+			"required": []string{"query"},
+		}, false),
+		responses.ToolParamOfFunction("shell", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"command": map[string]any{"type": "string", "description": "shell command to run"},
 			},
-		},
-		{
-			Function: openai.FunctionDefinitionParam{
-				Name:        "web_search",
-				Description: param.NewOpt("perform a web search and return top result titles and URLs"),
-				Parameters: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"query": map[string]interface{}{
-							"type":        "string",
-							"description": "search query",
-						},
-						"max_results": map[string]interface{}{
-							"type":        "integer",
-							"description": "maximum number of results to return (default 5, max 10)",
-						},
-					},
-					"required": []string{"query"},
-				},
+			"required": []string{"command"},
+		}, false),
+		responses.ToolParamOfFunction("web_search", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query":       map[string]any{"type": "string", "description": "search query"},
+				"max_results": map[string]any{"type": "integer", "description": "maximum number of results to return (default 5, max 10)"},
 			},
-		},
-		{
-			Function: openai.FunctionDefinitionParam{
-				Name:        "patch_file",
-				Description: param.NewOpt("apply a unified diff patch to files on disk"),
-				Parameters: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"patch": map[string]interface{}{"type": "string", "description": "unified diff patch content"},
-						"dir":   map[string]interface{}{"type": "string", "description": "directory to run patch from (optional)"},
-						"strip": map[string]interface{}{"type": "integer", "description": "override -p strip level (optional)"},
-					},
-					"required": []string{"patch"},
-				},
+			"required": []string{"query"},
+		}, false),
+		responses.ToolParamOfFunction("patch_file", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"patch": map[string]any{"type": "string", "description": "unified diff patch content"},
+				"dir":   map[string]any{"type": "string", "description": "directory to run patch from (optional)"},
+				"strip": map[string]any{"type": "integer", "description": "override -p strip level (optional)"},
 			},
-		},
+			"required": []string{"patch"},
+		}, false),
 	}
+	// Add descriptions (ToolParamOfFunction doesn't take a description arg).
+	tools[0].OfFunction.Description = param.NewOpt("query the postgres db")
+	tools[1].OfFunction.Description = param.NewOpt("run a shell command. There is a 10s timeout.")
+	tools[2].OfFunction.Description = param.NewOpt("perform a web search and return top result titles and URLs")
+	tools[3].OfFunction.Description = param.NewOpt("apply a unified diff patch to files on disk")
 
-	// Add the new message from the user to the context.
-	c.messages = append(c.messages, openai.UserMessage(line))
-	var chatCompletion *openai.ChatCompletion
+	// The first input is just the user's message; subsequent iterations send tool outputs.
+	input := responses.ResponseNewParamsInputUnion{OfString: param.NewOpt(line)}
+	prevID := c.prevRespID
+
+	var resp *responses.Response
 
 	cont := true
 	for cont {
 		cont = false
-		msg := openai.ChatCompletionNewParams{
-			Messages: c.messages,
-			Model:    "gpt-5",
-			Tools:    tools,
+		params := responses.ResponseNewParams{
+			Model:        "gpt-5",
+			Input:        input,
+			Instructions: param.NewOpt(c.instructions),
+			Tools:        tools,
+			Reasoning:    shared.ReasoningParam{Summary: shared.ReasoningSummaryAuto},
+			Truncation:   "auto",
 		}
+		if prevID != "" {
+			params.PreviousResponseID = param.NewOpt(prevID)
+		}
+
 		var err error
-
-		// Call the model.
-
 		start := time.Now()
-
 		var elapsed time.Duration
+
 		for i := 0; true; i++ {
-			chatCompletion, err = c.client.Chat.Completions.New(ctx, msg)
+			resp, err = c.client.Responses.New(ctx, params)
 			elapsed = time.Since(start)
 			c.llmCalls++
 			c.llmTime += elapsed
@@ -234,54 +210,61 @@ func (c *msgContext) call(ctx context.Context, line string) (string, error) {
 			time.Sleep(sleep)
 		}
 
-		// Log token usage and accumulate totals if available
-		u := chatCompletion.Usage
+		prevID = resp.ID
+
+		// Log token usage.
+		u := resp.Usage
 		c.tokens += u.TotalTokens
 		slog.Info("llm usage",
-			"id", chatCompletion.ID,
-			"model", chatCompletion.Model,
-			"prompt_tokens", u.PromptTokens,
-			"completion_tokens", u.CompletionTokens,
+			"id", resp.ID,
+			"model", resp.Model,
+			"input_tokens", u.InputTokens,
+			"output_tokens", u.OutputTokens,
 			"total_tokens", u.TotalTokens,
 			"elapsed", elapsed.String(),
 		)
 
-		message := chatCompletion.Choices[0].Message
-		mp := message.ToAssistantMessageParam()
-
-		// Append the result to the context.
-		c.messages = append(c.messages, openai.ChatCompletionMessageParamUnion{OfAssistant: &mp})
-
-		// If we have a tool call request from the module, first run the tool call, then add it to the model, then call the model again via `cont`.
-		for _, toolCall := range message.ToolCalls {
-			argsPreview := toolCall.Function.Arguments
-			if len(argsPreview) > 300 {
-				argsPreview = argsPreview[:300] + "… (truncated)"
+		// Process output items: print reasoning summaries and dispatch tool calls.
+		var toolOutputs []responses.ResponseInputItemUnionParam
+		for _, item := range resp.Output {
+			switch item.Type {
+			case "reasoning":
+				for _, s := range item.Summary {
+					fmt.Printf("[thinking] %s\n", s.Text)
+				}
+			case "function_call":
+				argsPreview := item.Arguments
+				if len(argsPreview) > 300 {
+					argsPreview = argsPreview[:300] + "… (truncated)"
+				}
+				slog.Info("tool call", "call_id", item.CallID, "name", item.Name, "args", argsPreview)
+				start = time.Now()
+				out, err := c.callTool(ctx, item.Name, item.Arguments)
+				elapsed = time.Since(start)
+				c.toolCalls++
+				c.toolTime += elapsed
+				slog.Info("tool metrics",
+					"calls", c.toolCalls,
+					"last_duration", elapsed.String(),
+					"total_tool_time", c.toolTime.String())
+				if err != nil {
+					slog.Error("error in tool call", "err", err)
+					out += "error " + err.Error()
+				}
+				toolOutputs = append(toolOutputs, responses.ResponseInputItemParamOfFunctionCallOutput(item.CallID, out))
+				cont = true
 			}
-			slog.Info("tool call", "id", toolCall.ID, "name", toolCall.Function.Name, "args", argsPreview)
-			start = time.Now()
-			out, err := c.callTool(ctx, toolCall.Function)
-			elapsed = time.Since(start)
-			// Track tool metrics
-			c.toolCalls++
-			c.toolTime += elapsed
-			slog.Info("tool metrics",
-				"calls", c.toolCalls,
-				"last_duration", elapsed.String(),
-				"total_tool_time", c.toolTime.String())
+		}
 
-			// If we got an error... just tell the model.
-			if err != nil {
-				slog.Error("error in tool call", "err", err)
-				out += "error " + err.Error()
-			}
-			c.messages = append(c.messages, openai.ToolMessage(out, toolCall.ID))
-			cont = true
+		if cont {
+			// Next loop iteration sends the tool results, linked via previous_response_id.
+			input = responses.ResponseNewParamsInputUnion{OfInputItemList: toolOutputs}
 		}
 	}
 
+	c.prevRespID = prevID
 	// Not a tool call. we have the final result.
-	return chatCompletion.Choices[0].Message.Content, nil
+	return resp.OutputText(), nil
 }
 
 // callTool dispatches the request to one of the tools provided.
@@ -391,14 +374,14 @@ func (c *msgContext) webSearch(args map[string]string) (string, error) {
 }
 
 // callTool dispatches the request to one of the tools provided.
-func (c *msgContext) callTool(ctx context.Context, in openai.ChatCompletionMessageToolCallFunction) (string, error) {
-	slog.Info("calltool.start", "name", in.Name, "args", in.Arguments)
+func (c *msgContext) callTool(ctx context.Context, name, arguments string) (string, error) {
+	slog.Info("calltool.start", "name", name, "args", arguments)
 	args := map[string]string{}
-	if err := json.Unmarshal([]byte(in.Arguments), &args); err != nil {
+	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
 		slog.Error("failed to unmarsh", "err", err)
 		return "", err
 	}
-	switch in.Name {
+	switch name {
 	case "postgres":
 		return c.postgres(args)
 	case "shell":
